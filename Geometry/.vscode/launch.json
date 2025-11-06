@@ -1,0 +1,98 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run API Server",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/api_server.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "FLASK_ENV": "development",
+                "PORT": "17654"
+            },
+            "justMyCode": true,
+            "presentation": {
+                "hidden": false,
+                "group": "servers",
+                "order": 1
+            }
+        },
+        {
+            "name": "Run API Server (Debug Mode)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/api_server.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "FLASK_ENV": "development",
+                "DEBUG": "True",
+                "PORT": "17654"
+            },
+            "justMyCode": false,
+            "presentation": {
+                "hidden": false,
+                "group": "servers",
+                "order": 2
+            }
+        },
+        {
+            "name": "Run CLI (Interactive Learning)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/geometry_manager.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": true,
+            "presentation": {
+                "hidden": false,
+                "group": "apps",
+                "order": 1
+            }
+        },
+        {
+            "name": "Run Test Suite",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/test_system.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": true,
+            "presentation": {
+                "hidden": false,
+                "group": "tests",
+                "order": 1
+            }
+        },
+        {
+            "name": "View Database Tables",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/view_tables.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": true,
+            "presentation": {
+                "hidden": false,
+                "group": "utilities",
+                "order": 1
+            }
+        },
+        {
+            "name": "Manage Sessions",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/check_sessions.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": true,
+            "presentation": {
+                "hidden": false,
+                "group": "utilities",
+                "order": 2
+            }
+        }
+    ]
+}
