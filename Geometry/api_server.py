@@ -34,8 +34,9 @@ CORS(app, supports_credentials=True)
 db_lock = Lock()
 session_lock = Lock()
 
-# In-memory storage for active geometry managers (keyed by session_id)
-active_managers = {}
+# In-memory storage for session state data (keyed by session_id)
+# We store state separately and create fresh GeometryManager instances per request
+session_states = {}
 
 
 # ============================================================================
@@ -51,14 +52,48 @@ def get_or_create_session_id():
 
 
 def get_geometry_manager():
-    """Get or create a GeometryManager instance for the current session."""
+    """
+    Get a GeometryManager instance for the current session.
+    Creates a new instance with fresh DB connection to avoid SQLite threading issues.
+    Restores session state from in-memory storage.
+    """
+    session_id = get_or_create_session_id()
+    
+    # Create a new GeometryManager instance (with fresh DB connection)
+    gm = GeometryManager()
+    
+    with session_lock:
+        # Restore state if exists
+        if session_id in session_states:
+            state_data = session_states[session_id]
+            gm.state = state_data['state']
+            gm.session = state_data['session_obj']
+            gm._pending_question = state_data.get('pending_question')
+            gm._resume_requested = state_data.get('resume_requested', False)
+    
+    return gm
+
+
+def save_geometry_manager_state(gm):
+    """
+    Save the GeometryManager state to in-memory storage.
+    Called after operations that modify state.
+    """
     session_id = get_or_create_session_id()
     
     with session_lock:
-        if session_id not in active_managers:
-            active_managers[session_id] = GeometryManager()
+        session_states[session_id] = {
+            'state': gm.state,
+            'session_obj': gm.session,
+            'pending_question': gm._pending_question,
+            'resume_requested': gm._resume_requested
+        }
     
-    return active_managers[session_id]
+    # Close the DB connection to free resources
+    try:
+        gm.close()
+    except:
+        pass
 
 
 def require_active_session(f):
@@ -66,7 +101,7 @@ def require_active_session(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         session_id = session.get('session_id')
-        if not session_id or session_id not in active_managers:
+        if not session_id or session_id not in session_states:
             return jsonify({
                 "error": "No active session found",
                 "message": "Please start a new session first"
@@ -106,17 +141,20 @@ def start_session():
     """
     session_id = get_or_create_session_id()
     
-    # Clean up any existing manager for this session
+    # Clean up any existing state for this session
     with session_lock:
-        if session_id in active_managers:
-            try:
-                active_managers[session_id].close()
-            except:
-                pass
-            del active_managers[session_id]
+        if session_id in session_states:
+            del session_states[session_id]
         
-        # Create new manager
-        active_managers[session_id] = GeometryManager()
+        # Create new initial state
+        gm = GeometryManager()
+        session_states[session_id] = {
+            'state': gm.state,
+            'session_obj': gm.session,
+            'pending_question': None,
+            'resume_requested': False
+        }
+        gm.close()  # Close the temporary connection
     
     return jsonify({
         "session_id": session_id,
@@ -137,21 +175,23 @@ def session_status():
     """
     session_id = session.get('session_id')
     
-    if not session_id or session_id not in active_managers:
+    if not session_id or session_id not in session_states:
         return jsonify({
             "active": False,
             "message": "No active session"
         }), 200
     
-    gm = active_managers[session_id]
+    # Get state from storage
+    with session_lock:
+        state_data = session_states[session_id]
     
     return jsonify({
         "session_id": session_id,
         "active": True,
         "state": {
-            "triangle_weights": gm.state['triangle_weights'],
-            "questions_count": gm.state['questions_count'],
-            "asked_questions": gm.state['asked_questions']
+            "triangle_weights": state_data['state']['triangle_weights'],
+            "questions_count": state_data['state']['questions_count'],
+            "asked_questions": state_data['state']['asked_questions']
         }
     }), 200
 
@@ -175,7 +215,11 @@ def end_session():
         session_data: Saved session data (if saved)
     """
     session_id = session['session_id']
-    gm = active_managers[session_id]
+    
+    # Get the session state
+    with session_lock:
+        state_data = session_states[session_id]
+        session_obj = state_data['session_obj']
     
     data = request.get_json() or {}
     
@@ -192,32 +236,31 @@ def end_session():
                 "error": "Invalid feedback value",
                 "message": "Feedback must be 4, 5, 6, or 7"
             }), 400
-        gm.session.set_feedback(feedback)
+        session_obj.set_feedback(feedback)
     
     # Set triangle types if provided
     if triangle_types:
         valid_types = [t for t in triangle_types if t in [0, 1, 2, 3]]
         if valid_types:
-            gm.session.set_triangle_type(valid_types)
+            session_obj.set_triangle_type(valid_types)
     
     # Set helpful theorems if provided
     if helpful_theorems:
         valid_theorems = [t for t in helpful_theorems if 1 <= t <= 63]
         if valid_theorems:
-            gm.session.set_helpful_theorems(valid_theorems)
+            session_obj.set_helpful_theorems(valid_theorems)
     
     # Save to database if requested
     session_data = None
     if save_to_db:
         with db_lock:
             session_db = SessionDB()
-            session_db.save_session(gm.session)
-        session_data = gm.session.to_dict()
+            session_db.save_session(session_obj)
+        session_data = session_obj.to_dict()
     
     # Clean up
     with session_lock:
-        gm.close()
-        del active_managers[session_id]
+        del session_states[session_id]
     
     session.clear()
     
@@ -239,20 +282,28 @@ def reset_session():
         new_state: The reset state
     """
     session_id = session['session_id']
-    gm = active_managers[session_id]
     
-    # Reset the state
-    gm.state = gm._initialize_state()
-    gm.session = Session()
-    gm._pending_question = None
-    gm._resume_requested = False
+    # Create a fresh manager to get initialized state
+    gm = GeometryManager()
+    
+    # Reset the state in storage
+    with session_lock:
+        session_states[session_id] = {
+            'state': gm.state,
+            'session_obj': Session(),
+            'pending_question': None,
+            'resume_requested': False
+        }
+        new_state = gm.state
+    
+    gm.close()
     
     return jsonify({
         "message": "Session state reset successfully",
         "new_state": {
-            "triangle_weights": gm.state['triangle_weights'],
-            "questions_count": gm.state['questions_count'],
-            "asked_questions": gm.state['asked_questions']
+            "triangle_weights": new_state['triangle_weights'],
+            "questions_count": new_state['questions_count'],
+            "asked_questions": new_state['asked_questions']
         }
     }), 200
 
@@ -278,10 +329,14 @@ def get_first_question():
     question = gm.get_first_question()
     
     if "error" in question:
+        gm.close()
         return jsonify(question), 404
     
     # Store as pending question
     gm._store_pending_question(question)
+    
+    # Save state
+    save_geometry_manager_state(gm)
     
     return jsonify(question), 200
 
@@ -311,7 +366,11 @@ def get_next_question():
             gm._store_pending_question(question)
     
     if "error" in question:
+        gm.close()
         return jsonify(question), 404
+    
+    # Save state
+    save_geometry_manager_state(gm)
     
     return jsonify(question), 200
 
@@ -331,7 +390,7 @@ def get_question_details(question_id):
         difficulty_level: Question difficulty (1-3)
         active: Whether question is active
     """
-    gm = get_geometry_manager()
+    gm = GeometryManager()
     
     with db_lock:
         cursor = gm.conn.cursor()
@@ -341,6 +400,8 @@ def get_question_details(question_id):
             WHERE question_id = ?
         """, (question_id,))
         row = cursor.fetchone()
+    
+    gm.close()
     
     if not row:
         return jsonify({"error": "Question not found"}), 404
@@ -362,7 +423,7 @@ def get_answer_options():
     Returns:
         answers: List of answer options with ID and text
     """
-    gm = get_geometry_manager()
+    gm = GeometryManager()
     
     with db_lock:
         cursor = gm.conn.cursor()
@@ -370,6 +431,8 @@ def get_answer_options():
         rows = cursor.fetchall()
     
     answers = [{"id": row["ansID"], "text": row["ans"]} for row in rows]
+    
+    gm.close()
     
     return jsonify({"answers": answers}), 200
 
@@ -395,12 +458,14 @@ def submit_answer():
     data = request.get_json()
     
     if not data:
+        gm.close()
         return jsonify({"error": "Request body is required"}), 400
     
     question_id = data.get('question_id')
     answer_id = data.get('answer_id')
     
     if question_id is None or answer_id is None:
+        gm.close()
         return jsonify({
             "error": "Missing required fields",
             "message": "Both question_id and answer_id are required"
@@ -408,6 +473,7 @@ def submit_answer():
     
     # Validate answer_id
     if answer_id not in [0, 1, 2, 3]:
+        gm.close()
         return jsonify({
             "error": "Invalid answer_id",
             "message": "answer_id must be between 0 and 3"
@@ -419,11 +485,16 @@ def submit_answer():
     # Get relevant theorems
     relevant_theorems = gm.get_relevant_theorems(question_id, answer_id)
     
-    return jsonify({
+    result = {
         "message": "Answer processed successfully",
         "updated_weights": gm.state['triangle_weights'],
         "relevant_theorems": relevant_theorems
-    }), 200
+    }
+    
+    # Save state
+    save_geometry_manager_state(gm)
+    
+    return jsonify(result), 200
 
 
 # ============================================================================
@@ -443,7 +514,7 @@ def get_all_theorems():
     Returns:
         theorems: List of theorems with details
     """
-    gm = get_geometry_manager()
+    gm = GeometryManager()
     active_only = request.args.get('active_only', 'true').lower() == 'true'
     category = request.args.get('category', type=int)
     
@@ -474,6 +545,8 @@ def get_all_theorems():
         "active": bool(row["active"])
     } for row in rows]
     
+    gm.close()
+    
     return jsonify({"theorems": theorems}), 200
 
 
@@ -493,7 +566,7 @@ def get_theorem_details(theorem_id):
         active: Whether theorem is active
         general_helpfulness: Overall helpfulness score
     """
-    gm = get_geometry_manager()
+    gm = GeometryManager()
     
     with db_lock:
         cursor = gm.conn.cursor()
@@ -507,6 +580,7 @@ def get_theorem_details(theorem_id):
         row = cursor.fetchone()
         
         if not row:
+            gm.close()
             return jsonify({"error": "Theorem not found"}), 404
         
         # Get general helpfulness
@@ -524,6 +598,8 @@ def get_theorem_details(theorem_id):
         "active": bool(row["active"]),
         "general_helpfulness": helpfulness_row["general_helpfulness"] if helpfulness_row else 0
     }
+    
+    gm.close()
     
     return jsonify(result), 200
 
@@ -547,6 +623,7 @@ def get_relevant_theorems():
     data = request.get_json()
     
     if not data:
+        gm.close()
         return jsonify({"error": "Request body is required"}), 400
     
     question_id = data.get('question_id')
@@ -554,12 +631,15 @@ def get_relevant_theorems():
     base_threshold = data.get('base_threshold', 0.01)
     
     if question_id is None or answer_id is None:
+        gm.close()
         return jsonify({
             "error": "Missing required fields",
             "message": "Both question_id and answer_id are required"
         }), 400
     
     theorems = gm.get_relevant_theorems(question_id, answer_id, base_threshold)
+    
+    gm.close()
     
     return jsonify({"theorems": theorems}), 200
 
@@ -619,9 +699,12 @@ def get_current_session_data():
         helpful_theorems: Helpful theorem IDs (if set)
     """
     session_id = session['session_id']
-    gm = active_managers[session_id]
     
-    return jsonify(gm.session.to_dict()), 200
+    # Get session object from storage
+    with session_lock:
+        session_obj = session_states[session_id]['session_obj']
+    
+    return jsonify(session_obj.to_dict()), 200
 
 
 @app.route('/api/sessions/statistics', methods=['GET'])
@@ -688,7 +771,7 @@ def get_feedback_options():
     Returns:
         feedback_options: List of feedback options with ID and text
     """
-    gm = get_geometry_manager()
+    gm = GeometryManager()
     
     with db_lock:
         cursor = gm.conn.cursor()
@@ -696,6 +779,8 @@ def get_feedback_options():
         rows = cursor.fetchall()
     
     feedback_options = [{"id": row["fbID"], "text": row["fb"]} for row in rows]
+    
+    gm.close()
     
     return jsonify({"feedback_options": feedback_options}), 200
 
@@ -716,7 +801,12 @@ def submit_feedback():
         message: Confirmation message
     """
     session_id = session['session_id']
-    gm = active_managers[session_id]
+    
+    # Get session data from storage
+    with session_lock:
+        state_data = session_states[session_id]
+        session_obj = state_data['session_obj']
+    
     data = request.get_json()
     
     if not data:
@@ -733,11 +823,12 @@ def submit_feedback():
             "message": "Feedback must be 4, 5, 6, or 7"
         }), 400
     
-    gm.session.set_feedback(feedback)
+    session_obj.set_feedback(feedback)
     
     # Handle return to exercise (feedback 7)
     if feedback == 7:
-        gm._resume_requested = True
+        with session_lock:
+            session_states[session_id]['resume_requested'] = True
         return jsonify({
             "message": "Feedback recorded. Will resume current question.",
             "action": "resume"
@@ -748,13 +839,13 @@ def submit_feedback():
     if triangle_types:
         valid_types = [t for t in triangle_types if t in [0, 1, 2, 3]]
         if valid_types:
-            gm.session.set_triangle_type(valid_types)
+            session_obj.set_triangle_type(valid_types)
     
     helpful_theorems = data.get('helpful_theorems', [])
     if helpful_theorems:
         valid_theorems = [t for t in helpful_theorems if 1 <= t <= 63]
         if valid_theorems:
-            gm.session.set_helpful_theorems(valid_theorems)
+            session_obj.set_helpful_theorems(valid_theorems)
     
     return jsonify({"message": "Feedback recorded successfully"}), 200
 
@@ -772,7 +863,7 @@ def get_database_tables():
     Returns:
         tables: List of table names
     """
-    gm = get_geometry_manager()
+    gm = GeometryManager()
     
     with db_lock:
         cursor = gm.conn.cursor()
@@ -780,6 +871,8 @@ def get_database_tables():
         rows = cursor.fetchall()
     
     tables = [row[0] for row in rows]
+    
+    gm.close()
     
     return jsonify({"tables": tables}), 200
 
@@ -793,7 +886,7 @@ def get_triangle_types():
     Returns:
         triangles: List of triangle types with IDs
     """
-    gm = get_geometry_manager()
+    gm = GeometryManager()
     
     with db_lock:
         cursor = gm.conn.cursor()
@@ -805,6 +898,8 @@ def get_triangle_types():
         "triangle_type": row["triangle_type"],
         "active": bool(row["active"])
     } for row in rows]
+    
+    gm.close()
     
     return jsonify({"triangles": triangles}), 200
 
@@ -820,7 +915,7 @@ def health_check():
     """
     return jsonify({
         "status": "healthy",
-        "active_sessions": len(active_managers)
+        "active_sessions": len(session_states)
     }), 200
 
 
