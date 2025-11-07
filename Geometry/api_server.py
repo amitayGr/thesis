@@ -8,6 +8,8 @@ and provides thread-safe operations for concurrent requests.
 
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
+from flask_caching import Cache
+from flask_compress import Compress
 from geometry_manager import GeometryManager
 from session_db import SessionDB
 from session import Session
@@ -18,6 +20,8 @@ import os
 from threading import Lock
 from functools import wraps
 from datetime import timedelta
+from queue import Queue, Empty
+import time
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -27,8 +31,76 @@ app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
 
+# Configure caching for static data
+app.config['CACHE_TYPE'] = 'SimpleCache'
+app.config['CACHE_DEFAULT_TIMEOUT'] = 300  # 5 minutes cache by default
+cache = Cache(app)
+
+# Enable response compression (gzip)
+app.config['COMPRESS_MIMETYPES'] = ['application/json', 'text/html', 'text/plain']
+app.config['COMPRESS_LEVEL'] = 6  # Compression level (1-9, 6 is balanced)
+app.config['COMPRESS_MIN_SIZE'] = 500  # Only compress responses > 500 bytes
+compress = Compress(app)
+
 # Enable CORS for cross-origin requests
 CORS(app, supports_credentials=True)
+
+# ============================================================================
+# Connection Pool for Database Performance
+# ============================================================================
+
+class ConnectionPool:
+    """
+    Thread-safe connection pool for SQLite databases.
+    Reduces overhead of creating connections per request.
+    """
+    def __init__(self, db_path, pool_size=10):
+        self.db_path = db_path
+        self.pool_size = pool_size
+        self.pool = Queue(maxsize=pool_size)
+        self.lock = Lock()
+        self.total_connections = 0
+        
+        # Pre-create connections
+        for _ in range(pool_size):
+            self.pool.put(self._create_connection())
+    
+    def _create_connection(self):
+        """Create a new database connection."""
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        self.total_connections += 1
+        return conn
+    
+    def get_connection(self, timeout=5):
+        """Get a connection from the pool."""
+        try:
+            return self.pool.get(timeout=timeout)
+        except Empty:
+            # If pool is exhausted, create a new temporary connection
+            app.logger.warning(f"Connection pool exhausted, creating temporary connection")
+            return self._create_connection()
+    
+    def return_connection(self, conn):
+        """Return a connection to the pool."""
+        try:
+            self.pool.put_nowait(conn)
+        except:
+            # Pool is full, close this connection
+            conn.close()
+    
+    def close_all(self):
+        """Close all connections in the pool."""
+        while not self.pool.empty():
+            try:
+                conn = self.pool.get_nowait()
+                conn.close()
+            except Empty:
+                break
+
+# Initialize connection pools
+geometry_pool = ConnectionPool('geometry_learning.db', pool_size=10)
+sessions_pool = ConnectionPool('sessions.db', pool_size=5)
 
 # Thread locks for database operations
 db_lock = Lock()
@@ -54,13 +126,18 @@ def get_or_create_session_id():
 def get_geometry_manager():
     """
     Get a GeometryManager instance for the current session.
-    Creates a new instance with fresh DB connection to avoid SQLite threading issues.
+    Uses connection pool for better performance.
     Restores session state from in-memory storage.
     """
     session_id = get_or_create_session_id()
     
-    # Create a new GeometryManager instance (with fresh DB connection)
+    # Get connection from pool
+    conn = geometry_pool.get_connection()
+    
+    # Create a new GeometryManager instance with pooled connection
     gm = GeometryManager()
+    gm.conn.close()  # Close the default connection
+    gm.conn = conn  # Use pooled connection
     
     with session_lock:
         # Restore state if exists
@@ -77,6 +154,7 @@ def get_geometry_manager():
 def save_geometry_manager_state(gm):
     """
     Save the GeometryManager state to in-memory storage.
+    Returns connection to pool instead of closing.
     Called after operations that modify state.
     """
     session_id = get_or_create_session_id()
@@ -89,9 +167,9 @@ def save_geometry_manager_state(gm):
             'resume_requested': gm._resume_requested
         }
     
-    # Close the DB connection to free resources
+    # Return connection to pool
     try:
-        gm.close()
+        geometry_pool.return_connection(gm.conn)
     except:
         pass
 
@@ -122,6 +200,29 @@ def handle_errors(f):
                 "error": "Internal server error",
                 "message": str(e)
             }), 500
+    return decorated_function
+
+
+def measure_performance(f):
+    """Decorator to measure endpoint performance."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        start_time = time.time()
+        result = f(*args, **kwargs)
+        elapsed = (time.time() - start_time) * 1000  # Convert to milliseconds
+        
+        # Log slow requests (> 100ms)
+        if elapsed > 100:
+            app.logger.warning(f"{f.__name__} took {elapsed:.2f}ms")
+        
+        # Add performance header
+        if isinstance(result, tuple):
+            response, status_code = result[0], result[1]
+            if hasattr(response, 'headers'):
+                response.headers['X-Response-Time'] = f"{elapsed:.2f}ms"
+            return result
+        return result
+    
     return decorated_function
 
 
@@ -503,6 +604,8 @@ def submit_answer():
 
 @app.route('/api/theorems', methods=['GET'])
 @handle_errors
+@measure_performance
+@cache.cached(timeout=300, query_string=True)  # Cache for 5 minutes based on query params
 def get_all_theorems():
     """
     Get all theorems in the system.
@@ -514,12 +617,12 @@ def get_all_theorems():
     Returns:
         theorems: List of theorems with details
     """
-    gm = GeometryManager()
+    conn = geometry_pool.get_connection()
     active_only = request.args.get('active_only', 'true').lower() == 'true'
     category = request.args.get('category', type=int)
     
     with db_lock:
-        cursor = gm.conn.cursor()
+        cursor = conn.cursor()
         
         query = "SELECT theorem_id, theorem_text, category, active FROM Theorems"
         conditions = []
@@ -545,7 +648,7 @@ def get_all_theorems():
         "active": bool(row["active"])
     } for row in rows]
     
-    gm.close()
+    geometry_pool.return_connection(conn)
     
     return jsonify({"theorems": theorems}), 200
 
@@ -764,6 +867,8 @@ def get_session_statistics():
 
 @app.route('/api/feedback/options', methods=['GET'])
 @handle_errors
+@measure_performance
+@cache.cached(timeout=600)  # Cache for 10 minutes - rarely changes
 def get_feedback_options():
     """
     Get available feedback options.
@@ -771,16 +876,16 @@ def get_feedback_options():
     Returns:
         feedback_options: List of feedback options with ID and text
     """
-    gm = GeometryManager()
+    conn = geometry_pool.get_connection()
     
     with db_lock:
-        cursor = gm.conn.cursor()
+        cursor = conn.cursor()
         cursor.execute("SELECT fbID, fb FROM inputFB")
         rows = cursor.fetchall()
     
     feedback_options = [{"id": row["fbID"], "text": row["fb"]} for row in rows]
     
-    gm.close()
+    geometry_pool.return_connection(conn)
     
     return jsonify({"feedback_options": feedback_options}), 200
 
@@ -879,6 +984,8 @@ def get_database_tables():
 
 @app.route('/api/db/triangles', methods=['GET'])
 @handle_errors
+@measure_performance
+@cache.cached(timeout=600)  # Cache for 10 minutes - rarely changes
 def get_triangle_types():
     """
     Get all triangle types.
@@ -886,10 +993,10 @@ def get_triangle_types():
     Returns:
         triangles: List of triangle types with IDs
     """
-    gm = GeometryManager()
+    conn = geometry_pool.get_connection()
     
     with db_lock:
-        cursor = gm.conn.cursor()
+        cursor = conn.cursor()
         cursor.execute("SELECT triangle_id, triangle_type, active FROM Triangles")
         rows = cursor.fetchall()
     
@@ -899,7 +1006,7 @@ def get_triangle_types():
         "active": bool(row["active"])
     } for row in rows]
     
-    gm.close()
+    geometry_pool.return_connection(conn)
     
     return jsonify({"triangles": triangles}), 200
 
