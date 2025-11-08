@@ -278,16 +278,23 @@ def start_session():
     with session_lock:
         if session_id in session_states:
             del session_states[session_id]
-        
-        # Create new initial state
-        gm = GeometryManager()
+    
+    # Create new initial state using pooled connection
+    conn = geometry_pool.get_connection()
+    gm = GeometryManager()
+    gm.conn.close()  # Close the default connection
+    gm.conn = conn  # Use pooled connection
+    
+    with session_lock:
         session_states[session_id] = {
             'state': gm.state,
             'session_obj': gm.session,
             'pending_question': None,
             'resume_requested': False
         }
-        gm.close()  # Close the temporary connection
+    
+    # Return connection to pool
+    geometry_pool.return_connection(conn)
     
     return jsonify({
         "session_id": session_id,
@@ -416,8 +423,11 @@ def reset_session():
     """
     session_id = session['session_id']
     
-    # Create a fresh manager to get initialized state
+    # Create a fresh manager to get initialized state using pooled connection
+    conn = geometry_pool.get_connection()
     gm = GeometryManager()
+    gm.conn.close()  # Close the default connection
+    gm.conn = conn  # Use pooled connection
     
     # Reset the state in storage
     with session_lock:
@@ -429,7 +439,8 @@ def reset_session():
         }
         new_state = gm.state
     
-    gm.close()
+    # Return connection to pool
+    geometry_pool.return_connection(conn)
     
     return jsonify({
         "message": "Session state reset successfully",
@@ -485,22 +496,24 @@ def bootstrap_initial_data():
         with session_lock:
             if session_id in session_states:
                 del session_states[session_id]
-            
-            # Create new session with GeometryManager
-            gm = GeometryManager()
-            
-            # Get first question
-            question_data = gm.get_first_question()
-            
-            # Save state
+        
+        # Create new session with GeometryManager using pooled connection
+        conn = geometry_pool.get_connection()
+        gm = GeometryManager()
+        gm.conn.close()  # Close the default connection
+        gm.conn = conn  # Use pooled connection
+        
+        # Get first question
+        question_data = gm.get_first_question()
+        
+        # Save state
+        with session_lock:
             session_states[session_id] = {
                 'state': gm.state,
                 'session_obj': gm.session,
                 'pending_question': question_data,
                 'resume_requested': False
             }
-            
-            geometry_pool.return_connection(gm.conn)
         
         result['session'] = {
             'session_id': session_id,
@@ -510,8 +523,7 @@ def bootstrap_initial_data():
         if 'error' not in question_data:
             result['first_question'] = question_data
             
-            # Get answer options for this question
-            conn = geometry_pool.get_connection()
+            # Get answer options for this question (reuse same connection)
             with db_lock:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -520,7 +532,6 @@ def bootstrap_initial_data():
                     WHERE question_id = ?
                 """, (question_data['question_id'],))
                 answers = cursor.fetchall()
-            geometry_pool.return_connection(conn)
             
             result['answer_options'] = {
                 'question_id': question_data['question_id'],
@@ -530,6 +541,9 @@ def bootstrap_initial_data():
                     'correct': bool(ans['correct'])
                 } for ans in answers]
             }
+        
+        # Return connection to pool
+        geometry_pool.return_connection(conn)
     
     # Get theorems if requested (from cache)
     if include_theorems:
