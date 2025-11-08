@@ -6,7 +6,7 @@ through RESTful API endpoints. It maintains session state using Flask sessions
 and provides thread-safe operations for concurrent requests.
 """
 
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify, session, make_response
 from flask_cors import CORS
 from flask_caching import Cache
 from flask_compress import Compress
@@ -22,6 +22,7 @@ from functools import wraps
 from datetime import timedelta
 from queue import Queue, Empty
 import time
+import hashlib
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -226,6 +227,37 @@ def measure_performance(f):
     return decorated_function
 
 
+def add_cache_headers(response_data, max_age=300):
+    """
+    Add HTTP caching headers (ETag, Cache-Control) to responses.
+    Enables browser caching and conditional requests (If-None-Match).
+    
+    Args:
+        response_data: Dict or JSON data to return
+        max_age: Cache duration in seconds (default 5 minutes)
+    
+    Returns:
+        Flask response with caching headers
+    """
+    # Generate ETag from response content
+    content = json.dumps(response_data, sort_keys=True)
+    etag = hashlib.md5(content.encode('utf-8')).hexdigest()
+    
+    # Check if client has cached version
+    client_etag = request.headers.get('If-None-Match')
+    if client_etag == etag:
+        # Client has current version, return 304 Not Modified
+        response = make_response('', 304)
+        response.headers['ETag'] = etag
+        return response
+    
+    # Return full response with caching headers
+    response = make_response(jsonify(response_data), 200)
+    response.headers['ETag'] = etag
+    response.headers['Cache-Control'] = f'public, max-age={max_age}'
+    return response
+
+
 # ============================================================================
 # Session Management Endpoints
 # ============================================================================
@@ -410,6 +442,144 @@ def reset_session():
 
 
 # ============================================================================
+# Optimized Batch Endpoints (Performance)
+# ============================================================================
+
+@app.route('/api/bootstrap', methods=['POST'])
+@handle_errors
+@measure_performance
+def bootstrap_initial_data():
+    """
+    Bootstrap endpoint that returns all initial data needed for the UI in a single request.
+    This dramatically reduces the number of round-trips needed to initialize the page.
+    
+    Request body (optional):
+        auto_start_session: Start a new session automatically (default: true)
+        include_theorems: Include full theorems list (default: true)
+        include_feedback_options: Include feedback options (default: true)
+        include_triangles: Include triangle types (default: true)
+    
+    Returns:
+        session: Session information (if started)
+        first_question: First question data (if session started)
+        answer_options: Available answer options
+        theorems: List of all theorems (if requested)
+        feedback_options: Available feedback options (if requested)
+        triangles: Triangle types (if requested)
+        
+    Performance: Replaces 4-6 separate API calls with 1 call
+    """
+    data = request.get_json() or {}
+    auto_start = data.get('auto_start_session', True)
+    include_theorems = data.get('include_theorems', True)
+    include_feedback = data.get('include_feedback_options', True)
+    include_triangles = data.get('include_triangles', True)
+    
+    result = {}
+    
+    # Start session and get first question if requested
+    if auto_start:
+        session_id = get_or_create_session_id()
+        
+        # Clean up any existing state
+        with session_lock:
+            if session_id in session_states:
+                del session_states[session_id]
+            
+            # Create new session with GeometryManager
+            gm = GeometryManager()
+            
+            # Get first question
+            question_data = gm.get_first_question()
+            
+            # Save state
+            session_states[session_id] = {
+                'state': gm.state,
+                'session_obj': gm.session,
+                'pending_question': question_data,
+                'resume_requested': False
+            }
+            
+            geometry_pool.return_connection(gm.conn)
+        
+        result['session'] = {
+            'session_id': session_id,
+            'started': True
+        }
+        
+        if 'error' not in question_data:
+            result['first_question'] = question_data
+            
+            # Get answer options for this question
+            conn = geometry_pool.get_connection()
+            with db_lock:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT answer_id, answer_text, correct 
+                    FROM Answers 
+                    WHERE question_id = ?
+                """, (question_data['question_id'],))
+                answers = cursor.fetchall()
+            geometry_pool.return_connection(conn)
+            
+            result['answer_options'] = {
+                'question_id': question_data['question_id'],
+                'answers': [{
+                    'answer_id': ans['answer_id'],
+                    'answer_text': ans['answer_text'],
+                    'correct': bool(ans['correct'])
+                } for ans in answers]
+            }
+    
+    # Get theorems if requested (from cache)
+    if include_theorems:
+        conn = geometry_pool.get_connection()
+        with db_lock:
+            cursor = conn.cursor()
+            cursor.execute("SELECT theorem_id, theorem_text, category, active FROM Theorems WHERE active = 1")
+            rows = cursor.fetchall()
+        geometry_pool.return_connection(conn)
+        
+        result['theorems'] = [{
+            'theorem_id': row['theorem_id'],
+            'theorem_text': row['theorem_text'],
+            'category': row['category'],
+            'active': bool(row['active'])
+        } for row in rows]
+    
+    # Get feedback options if requested (from cache)
+    if include_feedback:
+        conn = geometry_pool.get_connection()
+        with db_lock:
+            cursor = conn.cursor()
+            cursor.execute("SELECT fbID, fb FROM inputFB")
+            rows = cursor.fetchall()
+        geometry_pool.return_connection(conn)
+        
+        result['feedback_options'] = [{
+            'id': row['fbID'],
+            'text': row['fb']
+        } for row in rows]
+    
+    # Get triangle types if requested (from cache)
+    if include_triangles:
+        conn = geometry_pool.get_connection()
+        with db_lock:
+            cursor = conn.cursor()
+            cursor.execute("SELECT triangle_id, triangle_type, active FROM Triangles")
+            rows = cursor.fetchall()
+        geometry_pool.return_connection(conn)
+        
+        result['triangles'] = [{
+            'triangle_id': row['triangle_id'],
+            'triangle_type': row['triangle_type'],
+            'active': bool(row['active'])
+        } for row in rows]
+    
+    return jsonify(result), 200
+
+
+# ============================================================================
 # Question & Answer Flow Endpoints
 # ============================================================================
 
@@ -541,6 +711,7 @@ def get_answer_options():
 @app.route('/api/answers/submit', methods=['POST'])
 @require_active_session
 @handle_errors
+@measure_performance
 def submit_answer():
     """
     Submit an answer to the current question.
@@ -549,24 +720,32 @@ def submit_answer():
     Request body:
         question_id: Question identifier
         answer_id: Answer identifier (0-3)
+        include_next_question: Return next question in response (default: true)
+        include_answer_options: Return answer options for next question (default: true)
     
     Returns:
         message: Confirmation message
         updated_weights: New triangle weights
         relevant_theorems: Theorems relevant to this answer
+        next_question: Next question data (if requested and available)
+        answer_options: Answer options for next question (if requested)
+        
+    Performance: Combines answer submission + next question fetch in one call
     """
     gm = get_geometry_manager()
     data = request.get_json()
     
     if not data:
-        gm.close()
+        geometry_pool.return_connection(gm.conn)
         return jsonify({"error": "Request body is required"}), 400
     
     question_id = data.get('question_id')
     answer_id = data.get('answer_id')
+    include_next = data.get('include_next_question', True)
+    include_answers = data.get('include_answer_options', True)
     
     if question_id is None or answer_id is None:
-        gm.close()
+        geometry_pool.return_connection(gm.conn)
         return jsonify({
             "error": "Missing required fields",
             "message": "Both question_id and answer_id are required"
@@ -574,7 +753,7 @@ def submit_answer():
     
     # Validate answer_id
     if answer_id not in [0, 1, 2, 3]:
-        gm.close()
+        geometry_pool.return_connection(gm.conn)
         return jsonify({
             "error": "Invalid answer_id",
             "message": "answer_id must be between 0 and 3"
@@ -591,6 +770,38 @@ def submit_answer():
         "updated_weights": gm.state['triangle_weights'],
         "relevant_theorems": relevant_theorems
     }
+    
+    # Get next question if requested (performance optimization)
+    if include_next:
+        try:
+            next_question = gm.get_next_question()
+            if 'error' not in next_question:
+                result['next_question'] = next_question
+                
+                # Get answer options for next question if requested
+                if include_answers and 'question_id' in next_question:
+                    cursor = gm.conn.cursor()
+                    cursor.execute("""
+                        SELECT answer_id, answer_text, correct 
+                        FROM Answers 
+                        WHERE question_id = ?
+                    """, (next_question['question_id'],))
+                    answers = cursor.fetchall()
+                    
+                    result['answer_options'] = {
+                        'question_id': next_question['question_id'],
+                        'answers': [{
+                            'answer_id': ans['answer_id'],
+                            'answer_text': ans['answer_text'],
+                            'correct': bool(ans['correct'])
+                        } for ans in answers]
+                    }
+            else:
+                result['next_question'] = None
+                result['session_complete'] = True
+        except Exception as e:
+            app.logger.warning(f"Could not fetch next question: {e}")
+            result['next_question'] = None
     
     # Save state
     save_geometry_manager_state(gm)
@@ -650,7 +861,8 @@ def get_all_theorems():
     
     geometry_pool.return_connection(conn)
     
-    return jsonify({"theorems": theorems}), 200
+    # Return with HTTP caching headers (ETag, Cache-Control)
+    return add_cache_headers({"theorems": theorems}, max_age=300)
 
 
 @app.route('/api/theorems/<int:theorem_id>', methods=['GET'])
@@ -861,6 +1073,80 @@ def get_session_statistics():
     }), 200
 
 
+@app.route('/api/admin/dashboard', methods=['GET'])
+@handle_errors
+@measure_performance
+def get_admin_dashboard():
+    """
+    Get comprehensive admin dashboard data in a single request.
+    Combines session statistics, theorems, and system health.
+    
+    Returns:
+        statistics: Session statistics
+        theorems: All theorems with details
+        system_health: Current system status
+        active_sessions: Number of active sessions
+        
+    Performance: Replaces 3-4 separate API calls with 1 call
+    """
+    result = {}
+    
+    # Get session statistics
+    with db_lock:
+        session_db = SessionDB()
+        all_sessions = session_db.load_all_sessions()
+    
+    if all_sessions:
+        feedback_dist = {4: 0, 5: 0, 6: 0, 7: 0}
+        total_interactions = 0
+        theorem_counts = {}
+        
+        for sess in all_sessions:
+            fb = sess.get('feedback')
+            if fb in feedback_dist:
+                feedback_dist[fb] += 1
+            total_interactions += len(sess.get('interactions', []))
+            for tid in sess.get('helpful_theorems', []):
+                theorem_counts[tid] = theorem_counts.get(tid, 0) + 1
+        
+        top_theorems = sorted(theorem_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        
+        result['statistics'] = {
+            "total_sessions": len(all_sessions),
+            "feedback_distribution": feedback_dist,
+            "average_interactions": total_interactions / len(all_sessions),
+            "most_helpful_theorems": [{"theorem_id": tid, "count": count} for tid, count in top_theorems]
+        }
+    else:
+        result['statistics'] = {"total_sessions": 0, "message": "No sessions found"}
+    
+    # Get all theorems
+    conn = geometry_pool.get_connection()
+    with db_lock:
+        cursor = conn.cursor()
+        cursor.execute("SELECT theorem_id, theorem_text, category, active FROM Theorems WHERE active = 1")
+        rows = cursor.fetchall()
+    
+    result['theorems'] = [{
+        "theorem_id": row["theorem_id"],
+        "theorem_text": row["theorem_text"],
+        "category": row["category"],
+        "active": bool(row["active"])
+    } for row in rows]
+    
+    geometry_pool.return_connection(conn)
+    
+    # System health info
+    result['system_health'] = {
+        "status": "healthy",
+        "active_sessions": len(session_states),
+        "connection_pool_size": geometry_pool.pool_size,
+        "total_connections": geometry_pool.total_connections
+    }
+    
+    return jsonify(result), 200
+
+
 # ============================================================================
 # Feedback Endpoints
 # ============================================================================
@@ -887,7 +1173,8 @@ def get_feedback_options():
     
     geometry_pool.return_connection(conn)
     
-    return jsonify({"feedback_options": feedback_options}), 200
+    # Return with HTTP caching headers (static data, cache longer)
+    return add_cache_headers({"feedback_options": feedback_options}, max_age=600)
 
 
 @app.route('/api/feedback/submit', methods=['POST'])
@@ -1008,7 +1295,8 @@ def get_triangle_types():
     
     geometry_pool.return_connection(conn)
     
-    return jsonify({"triangles": triangles}), 200
+    # Return with HTTP caching headers (static data, cache longer)
+    return add_cache_headers({"triangles": triangles}, max_age=600)
 
 
 @app.route('/api/health', methods=['GET'])
