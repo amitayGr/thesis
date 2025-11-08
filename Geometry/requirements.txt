@@ -4,8 +4,6 @@
 # Web Framework
 Flask==3.0.0
 Flask-Cors==4.0.0
-Flask-Caching==2.1.0
-Flask-Compress==1.14
 
 # Database
 # SQLite is included in Python standard library, but we use SQLAlchemy for some utilities
@@ -22,5 +20,3 @@ pandas==2.1.3
 # - datetime
 # - os
 # - collections
-# - queue
-# - time
