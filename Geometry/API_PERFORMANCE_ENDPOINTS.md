@@ -40,21 +40,6 @@ All parameters are optional and default to `true`.
     "question_id": 1,
     "question_text": "What is the sum of angles in a triangle?"
   },
-  "answer_options": {
-    "question_id": 1,
-    "answers": [
-      {
-        "answer_id": 0,
-        "answer_text": "90 degrees",
-        "correct": false
-      },
-      {
-        "answer_id": 1,
-        "answer_text": "180 degrees",
-        "correct": true
-      }
-    ]
-  },
   "theorems": [
     {
       "theorem_id": 1,
@@ -79,8 +64,10 @@ All parameters are optional and default to `true`.
 }
 ```
 
+**Note:** Answer options are not included in the bootstrap response as the database schema does not contain a separate Answers table. Answer handling is managed differently in the application.
+
 **Performance:**
-- **Replaces:** 6 separate API calls
+- **Replaces:** 5 separate API calls (session start + first question + theorems + feedback options + triangles)
 - **Time Savings:** 75-85% faster (300-600ms → 50-100ms)
 
 **Example (Python):**
@@ -96,7 +83,6 @@ response = requests.post('http://localhost:17654/api/bootstrap', json={
 
 data = response.json()
 question = data['first_question']
-answers = data['answer_options']['answers']
 theorems = data['theorems']
 ```
 
@@ -161,10 +147,6 @@ New parameters:
   "next_question": {
     "question_id": 2,
     "question_text": "..."
-  },
-  "answer_options": {
-    "question_id": 2,
-    "answers": [...]
   }
 }
 ```
@@ -180,24 +162,25 @@ If no next question available (session complete):
 }
 ```
 
+**Note:** The `include_answer_options` parameter is deprecated and has no effect. Answer options are not stored in a separate database table and are handled differently in the application.
+
 **Performance:**
-- **Replaces:** 3 separate API calls
-- **Time Savings:** 67-75% faster (120-180ms → 40-60ms)
+- **Replaces:** 2 separate API calls (submit answer + get next question)
+- **Time Savings:** 50-60% faster (100-120ms → 40-50ms)
 
 **Example (Python):**
 ```python
 response = requests.post('http://localhost:17654/api/answers/submit', json={
     "question_id": 1,
     "answer_id": 2,
-    "include_next_question": True,
-    "include_answer_options": True
+    "include_next_question": True
 })
 
 data = response.json()
 next_question = data.get('next_question')
 if next_question:
     # Continue with next question
-    answers = data['answer_options']['answers']
+    print(f"Next: {next_question['question_text']}")
 else:
     # Session complete
     print("No more questions")

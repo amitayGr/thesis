@@ -522,25 +522,6 @@ def bootstrap_initial_data():
         
         if 'error' not in question_data:
             result['first_question'] = question_data
-            
-            # Get answer options for this question (reuse same connection)
-            with db_lock:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT answer_id, answer_text, correct 
-                    FROM Answers 
-                    WHERE question_id = ?
-                """, (question_data['question_id'],))
-                answers = cursor.fetchall()
-            
-            result['answer_options'] = {
-                'question_id': question_data['question_id'],
-                'answers': [{
-                    'answer_id': ans['answer_id'],
-                    'answer_text': ans['answer_text'],
-                    'correct': bool(ans['correct'])
-                } for ans in answers]
-            }
         
         # Return connection to pool
         geometry_pool.return_connection(conn)
@@ -791,25 +772,6 @@ def submit_answer():
             next_question = gm.get_next_question()
             if 'error' not in next_question:
                 result['next_question'] = next_question
-                
-                # Get answer options for next question if requested
-                if include_answers and 'question_id' in next_question:
-                    cursor = gm.conn.cursor()
-                    cursor.execute("""
-                        SELECT answer_id, answer_text, correct 
-                        FROM Answers 
-                        WHERE question_id = ?
-                    """, (next_question['question_id'],))
-                    answers = cursor.fetchall()
-                    
-                    result['answer_options'] = {
-                        'question_id': next_question['question_id'],
-                        'answers': [{
-                            'answer_id': ans['answer_id'],
-                            'answer_text': ans['answer_text'],
-                            'correct': bool(ans['correct'])
-                        } for ans in answers]
-                    }
             else:
                 result['next_question'] = None
                 result['session_complete'] = True
